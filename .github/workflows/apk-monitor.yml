@@ -107,6 +107,8 @@ jobs:
         run: |
           set -euo pipefail
           cd openwa
+          exec > >(tee ../send-step.log) 2>&1
+          set -x
           mkdir -p data
           printf 'ENGINE_TYPE=baileys\nPORT=2785\n' > .env
           # La chiave API va passata via API_MASTER_KEY al primo avvio
@@ -186,6 +188,16 @@ jobs:
                   print("risposta:", r.read().decode()[:200])
           print("tutti gli APK inviati")
           EOF
+
+      - name: Carica log di debug (se fallisce)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwa-debug
+          path: |
+            send-step.log
+            openwa-server.log
+          retention-days: 3
 
       - name: Aggiorna state.json e commit
         if: steps.check.outputs.has_updates == 'true'
