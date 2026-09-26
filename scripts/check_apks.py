@@ -17,8 +17,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 APPS = {
     "vanced": {
-        "label": "YouTube Vanced",
-        "page": "https://leeapk.com/youtube-vanced-mod-apk/",
+        "label": "YouTube Premium",
+        "page": "https://leeapk.com/youtube-premium-mod-apk/",
     },
     "music": {
         "label": "YouTube Music Premium",
