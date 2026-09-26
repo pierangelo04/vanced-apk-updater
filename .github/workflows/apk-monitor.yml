@@ -166,7 +166,7 @@ jobs:
           group = os.environ["WA_GROUP_ID"]
           res = json.load(open('/tmp/check_result.json'))
           for u in res["updates"]:
-              path = "apks/" + u["filename"]
+              path = os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), "apks", u["filename"])
               print("invio", u["filename"])
               with open(path, "rb") as f:
                   b64 = base64.b64encode(f.read()).decode()
