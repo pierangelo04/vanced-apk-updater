@@ -113,6 +113,7 @@ jobs:
           printf 'ENGINE_TYPE=baileys\nPORT=2785\n' > .env
           # La chiave API va passata via API_MASTER_KEY al primo avvio
           API_MASTER_KEY="$OPENWA_API_KEY" BODY_SIZE_LIMIT=300mb \
+            MEDIA_DOWNLOAD_MAX_BYTES=314572800 \
             node dist/main.js > ../openwa-server.log 2>&1 &
           SRV=$!
           trap 'kill $SRV 2>/dev/null || true' EXIT
