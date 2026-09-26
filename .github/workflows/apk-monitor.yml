@@ -1,0 +1,211 @@
+name: Monitor APK Vanced
+
+# Controlla ogni 6 ore se su LeeAPK ci sono nuove versioni di
+# YouTube Vanced e YouTube Music Premium. Se si', scarica gli APK
+# e li invia come documenti WhatsApp al gruppo "Distribuzione di app"
+# tramite OpenWA (motore Baileys), che gira DIRETTAMENTE sul runner.
+#
+# Secrets richiesti (mai nel codice, repo pubblica):
+#   OPENWA_API_KEY          chiave API di OpenWA
+#   OPENWA_BAILEYS_CREDS_B64  creds.json Baileys in base64
+#   WA_GROUP_ID             ID del gruppo WhatsApp destinatario
+#
+# Se la sessione non si ripristina piu' (stato qr_ready/failed),
+# rigenerare OPENWA_BAILEYS_CREDS_B64 con un nuovo pairing.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vanced-apk-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Controlla aggiornamenti su LeeAPK
+        id: check
+        run: |
+          set -euo pipefail
+          python3 scripts/check_apks.py > /tmp/check_result.json
+          cat /tmp/check_result.json
+          N=$(python3 -c "import json; print(len(json.load(open('/tmp/check_result.json'))['updates']))")
+          echo "aggiornamenti trovati: $N"
+          echo "has_updates=$([ "$N" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Scarica gli APK aggiornati
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p apks
+          python3 - << 'EOF'
+          import json, urllib.request
+          res = json.load(open('/tmp/check_result.json'))
+          for u in res['updates']:
+              dest = 'apks/' + u['filename']
+              print('scarico', u['filename'])
+              req = urllib.request.Request(u['apk_url'], headers={
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'})
+              with urllib.request.urlopen(req, timeout=120) as r, open(dest, 'wb') as f:
+                  while True:
+                      chunk = r.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      f.write(chunk)
+              print('ok', dest)
+          EOF
+          ls -la apks/
+
+      - name: Setup Node
+        if: steps.check.outputs.has_updates == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Cache npm (dipendenze OpenWA)
+        if: steps.check.outputs.has_updates == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-openwa-v1
+
+      - name: Clona e compila OpenWA
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          set -euxo pipefail
+          rm -rf openwa
+          git clone --depth 1 https://github.com/rmyndharis/OpenWA openwa
+          cd openwa
+          # Niente Chromium: usiamo solo il motore Baileys
+          export PUPPETEER_SKIP_DOWNLOAD=1
+          npm ci --no-audit --no-fund --loglevel=error
+          npm run build
+
+      - name: Avvia OpenWA e invia gli APK su WhatsApp
+        if: steps.check.outputs.has_updates == 'true'
+        env:
+          OPENWA_API_KEY: ${{ secrets.OPENWA_API_KEY }}
+          OPENWA_BAILEYS_CREDS_B64: ${{ secrets.OPENWA_BAILEYS_CREDS_B64 }}
+          WA_GROUP_ID: ${{ secrets.WA_GROUP_ID }}
+        run: |
+          set -euo pipefail
+          cd openwa
+          mkdir -p data
+          printf 'ENGINE_TYPE=baileys\nPORT=2785\n' > .env
+          # La chiave API va passata via API_MASTER_KEY al primo avvio
+          API_MASTER_KEY="$OPENWA_API_KEY" BODY_SIZE_LIMIT=300mb \
+            node dist/main.js > ../openwa-server.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          API="http://127.0.0.1:2785"
+          # 1. attesa avvio server con motore baileys
+          for i in $(seq 1 24); do
+            if curl -sf -m 5 -H "x-api-key: $OPENWA_API_KEY" \
+                "$API/api/infra/engines/current" 2>/dev/null | grep -q baileys; then
+              echo "OpenWA avviato (motore baileys)"
+              break
+            fi
+            sleep 5
+            if [ "$i" = 24 ]; then
+              echo "::error::OpenWA non partito in tempo"
+              tail -n 30 ../openwa-server.log || true
+              exit 1
+            fi
+          done
+          # 2. crea sessione e ripristina le credenziali Baileys dal secret
+          SID=$(curl -sf -m 15 -X POST -H "x-api-key: $OPENWA_API_KEY" \
+            -H 'Content-Type: application/json' -d '{"name":"vanced-apk"}' \
+            "$API/api/sessions" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          echo "sessione: $SID"
+          mkdir -p "data/baileys/$SID"
+          printf '%s' "$OPENWA_BAILEYS_CREDS_B64" | base64 -d > "data/baileys/$SID/creds.json"
+          chmod 600 "data/baileys/$SID/creds.json"
+          curl -sf -m 15 -X POST -H "x-api-key: $OPENWA_API_KEY" \
+            "$API/api/sessions/$SID/start" > /dev/null
+          # 3. attesa connessione a WhatsApp
+          for i in $(seq 1 36); do
+            ST=$(curl -s -m 10 -H "x-api-key: $OPENWA_API_KEY" \
+              "$API/api/sessions/$SID" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "?")
+            echo "stato sessione: $ST"
+            [ "$ST" = ready ] && break
+            if [ "$ST" = qr_ready ] || [ "$ST" = failed ]; then
+              echo "::error::sessione WhatsApp non ripristinata (stato $ST): rigenerare il secret OPENWA_BAILEYS_CREDS_B64"
+              exit 1
+            fi
+            sleep 5
+            if [ "$i" = 36 ]; then
+              echo "::error::timeout connessione WhatsApp"
+              exit 1
+            fi
+          done
+          # 4. invio di ogni APK come documento al gruppo
+          export SID WA_GROUP_ID
+          python3 - << 'EOF'
+          import base64, json, os, urllib.request
+          api_key = os.environ["OPENWA_API_KEY"]
+          api = "http://127.0.0.1:2785"
+          sid = os.environ["SID"]
+          group = os.environ["WA_GROUP_ID"]
+          res = json.load(open('/tmp/check_result.json'))
+          for u in res["updates"]:
+              path = "apks/" + u["filename"]
+              print("invio", u["filename"])
+              with open(path, "rb") as f:
+                  b64 = base64.b64encode(f.read()).decode()
+              body = json.dumps({
+                  "chatId": group,
+                  "base64": b64,
+                  "mimetype": "application/vnd.android.package-archive",
+                  "filename": u["filename"],
+                  "caption": f"{u['label']} v{u['version']} — aggiornamento",
+              }).encode()
+              req = urllib.request.Request(
+                  f"{api}/api/sessions/{sid}/messages/send-document",
+                  data=body,
+                  headers={"Content-Type": "application/json",
+                           "x-api-key": api_key})
+              with urllib.request.urlopen(req, timeout=300) as r:
+                  print("risposta:", r.read().decode()[:200])
+          print("tutti gli APK inviati")
+          EOF
+
+      - name: Aggiorna state.json e commit
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          set -euo pipefail
+          # Aggiorna state.json con le nuove versioni inviate
+          python3 - << 'EOF'
+          import json
+          from datetime import datetime, timezone
+          res = json.load(open('/tmp/check_result.json'))
+          state = json.load(open('state.json'))
+          now = datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+          for u in res['updates']:
+              state[u['key']] = {'version': u['version'], 'build': u['build'],
+                                 'checked_at': now}
+          json.dump(state, open('state.json', 'w'), indent=2, sort_keys=True)
+          print(open('state.json').read())
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Aggiorna versioni APK inviate" || echo "niente da committare"
+          git push
