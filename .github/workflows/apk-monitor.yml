@@ -106,9 +106,13 @@ jobs:
           WA_GROUP_ID: ${{ secrets.WA_GROUP_ID }}
         run: |
           set -euo pipefail
+          # Niente `set -x` in questo step: stampava nei log (repo pubblica) la chiave
+          # API e il contenuto base64 di creds.json, cioe' la sessione WhatsApp.
+          echo "::add-mask::$OPENWA_API_KEY"
+          echo "::add-mask::$OPENWA_BAILEYS_CREDS_B64"
+          echo "::add-mask::$WA_GROUP_ID"
           cd openwa
           exec > >(tee ../send-step.log) 2>&1
-          set -x
           mkdir -p data
           printf 'ENGINE_TYPE=baileys\nPORT=2785\n' > .env
           # La chiave API va passata via API_MASTER_KEY al primo avvio
@@ -140,6 +144,8 @@ jobs:
           mkdir -p "data/baileys/$SID"
           printf '%s' "$OPENWA_BAILEYS_CREDS_B64" | base64 -d > "data/baileys/$SID/creds.json"
           chmod 600 "data/baileys/$SID/creds.json"
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "data/baileys/$SID/creds.json" \
+            || { echo "::error::OPENWA_BAILEYS_CREDS_B64 non contiene un creds.json valido (base64/json)"; exit 1; }
           curl -sf -m 15 -X POST -H "x-api-key: $OPENWA_API_KEY" \
             "$API/api/sessions/$SID/start" > /dev/null
           # 3. attesa connessione a WhatsApp
@@ -150,7 +156,7 @@ jobs:
             echo "stato sessione: $ST"
             [ "$ST" = ready ] && break
             if [ "$ST" = qr_ready ] || [ "$ST" = failed ]; then
-              echo "::error::sessione WhatsApp non ripristinata (stato $ST): rigenerare il secret OPENWA_BAILEYS_CREDS_B64"
+              echo "::error::sessione WhatsApp non ripristinata (stato $ST): WhatsApp ha invalidato il dispositivo collegato, rigenerare il secret OPENWA_BAILEYS_CREDS_B64"
               exit 1
             fi
             sleep 5
