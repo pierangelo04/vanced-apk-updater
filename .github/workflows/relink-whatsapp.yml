@@ -1,0 +1,185 @@
+name: Rilink WhatsApp (OpenWA)
+
+# Ricollega la sessione WhatsApp usata da "Monitor APK Vanced" e salva il nuovo
+# creds.json nel secret OPENWA_BAILEYS_CREDS_B64.
+#
+# Si avvia a mano: Actions -> "Rilink WhatsApp (OpenWA)" -> Run workflow, indicando
+# il numero del bot (solo cifre, con prefisso internazionale).
+#
+# Secret richiesto:
+#   REPO_SECRETS_PAT  fine-grained PAT con permesso "Secrets: Read and write" su
+#                     questa sola repository (il token di Actions non puo' scrivere
+#                     i secret; serve un PAT salvato come secret).
+#
+# Come funziona: il job avvia OpenWA (motore Baileys) sul runner, crea una
+# sessione, chiede a WhatsApp un codice di abbinamento di 8 caratteri e lo mostra
+# nel riepilogo del job. Il codice va inserito sul telefono del bot
+# (WhatsApp -> Dispositivi collegati -> Collega un dispositivo -> Collega con
+# numero di telefono). Appena la sessione passa a "ready" il job salva il nuovo
+# creds.json nel secret: da li' "Monitor APK Vanced" torna a funzionare.
+#
+# Nessun valore segreto viene stampato nei log: il creds.json esce solo come
+# input di `gh secret set`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone:
+        description: "Numero WhatsApp del bot, solo cifre con prefisso internazionale (es. 393381234567)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wa-relink
+  cancel-in-progress: false
+
+jobs:
+  relink:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Clona e compila OpenWA
+        run: |
+          set -euo pipefail
+          rm -rf openwa
+          git clone --depth 1 https://github.com/rmyndharis/OpenWA openwa
+          cd openwa
+          export PUPPETEER_SKIP_DOWNLOAD=1
+          npm ci --no-audit --no-fund --loglevel=error
+          npm run build
+
+      - name: Abbina il numero e salva il nuovo secret
+        env:
+          PHONE: ${{ inputs.phone }}
+          REPO_SECRETS_PAT: ${{ secrets.REPO_SECRETS_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REPO_SECRETS_PAT:-}" ]; then
+            echo "::error::manca il secret REPO_SECRETS_PAT (fine-grained PAT con permesso Secrets: Read and write su questa repo)"
+            exit 1
+          fi
+          case "${PHONE:-}" in
+            ''|*[!0-9]*)
+              echo "::error::il numero deve contenere solo cifre, prefisso internazionale incluso (es. 393381234567)"
+              exit 1
+              ;;
+          esac
+
+          API_KEY=$(openssl rand -hex 32)
+          echo "::add-mask::$API_KEY"
+          API=http://127.0.0.1:2785
+
+          cd openwa
+          mkdir -p data
+          printf 'ENGINE_TYPE=baileys\nPORT=2785\n' > .env
+          API_MASTER_KEY="$API_KEY" BODY_SIZE_LIMIT=300mb \
+            node dist/main.js > ../relink-server.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+
+          # 1. server pronto con motore baileys
+          for i in $(seq 1 24); do
+            if curl -sf -m 5 -H "x-api-key: $API_KEY" \
+                "$API/api/infra/engines/current" 2>/dev/null | grep -q baileys; then
+              echo "OpenWA avviato (motore baileys)"
+              break
+            fi
+            sleep 5
+            if [ "$i" = 24 ]; then
+              echo "::error::OpenWA non partito in tempo"
+              tail -n 30 ../relink-server.log || true
+              exit 1
+            fi
+          done
+
+          # 2. sessione nuova (senza credenziali: servira' il codice di abbinamento)
+          SID=$(curl -sf -m 15 -X POST -H "x-api-key: $API_KEY" \
+            -H 'Content-Type: application/json' -d '{"name":"wa-relink"}' \
+            "$API/api/sessions" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          echo "sessione: $SID"
+          curl -sf -m 15 -X POST -H "x-api-key: $API_KEY" \
+            "$API/api/sessions/$SID/start" > /dev/null
+
+          status() {
+            curl -s -m 10 -H "x-api-key: $API_KEY" "$API/api/sessions/$SID" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null \
+              || echo "?"
+          }
+
+          # 3. attesa del momento in cui WhatsApp accetta di chiedere un codice
+          ST=""
+          for i in $(seq 1 24); do
+            ST=$(status)
+            echo "stato sessione: $ST"
+            case "$ST" in
+              qr_ready|connecting|initializing) ;;
+              ready|authenticating) echo "::error::sessione gia' collegata (stato $ST)"; exit 1 ;;
+            esac
+            [ "$ST" = qr_ready ] && break
+            sleep 5
+          done
+          if [ "$ST" != qr_ready ]; then
+            echo "::error::la sessione non e' pronta per l'abbinamento (stato $ST)"
+            tail -n 40 ../relink-server.log || true
+            exit 1
+          fi
+
+          {
+            echo "## Abbina il numero su WhatsApp"
+            echo
+            echo "Su WhatsApp del numero +$PHONE: **Dispositivi collegati -> Collega un dispositivo -> Collega con numero di telefono**,"
+            echo "poi inserisci l'ultimo codice qui sotto (i codici scadono dopo pochi minuti: se scade, il job ne stampa un altro)."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 4. fino a 6 codici, 2 minuti di attesa ciascuno
+          READY=0
+          for round in $(seq 1 6); do
+            ST=$(status)
+            [ "$ST" = ready ] && { READY=1; break; }
+            if [ "$ST" != qr_ready ]; then
+              echo "attesa ritorno a qr_ready (stato $ST)"
+              for i in $(seq 1 12); do
+                sleep 5
+                ST=$(status)
+                [ "$ST" = qr_ready ] && break
+              done
+              [ "$ST" = qr_ready ] || { echo "::error::sessione non pronta per il codice (stato $ST)"; exit 1; }
+            fi
+            CODE=$(curl -sf -m 20 -X POST -H "x-api-key: $API_KEY" \
+              -H 'Content-Type: application/json' -d "{\"phoneNumber\":\"$PHONE\"}" \
+              "$API/api/sessions/$SID/pairing-code" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin)['pairingCode'])")
+            echo "### Codice $round/6: \`$CODE\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "codice $round generato (nel riepilogo del job)"
+            for i in $(seq 1 24); do
+              sleep 5
+              ST=$(status)
+              [ "$ST" = ready ] && { READY=1; break 2; }
+            done
+            [ "$READY" = 1 ] && break
+          done
+
+          if [ "$READY" != 1 ]; then
+            echo "::error::abbinamento non completato (stato $ST): codice scaduto o non inserito"
+            tail -n 40 ../relink-server.log || true
+            exit 1
+          fi
+          echo "sessione collegata, salvo il nuovo secret"
+
+          # 5. salva il nuovo creds.json nel secret (mai stampato nei log)
+          base64 -w0 "data/baileys/$SID/creds.json" > "$RUNNER_TEMP/creds.b64"
+          GH_TOKEN="$REPO_SECRETS_PAT" gh secret set OPENWA_BAILEYS_CREDS_B64 -R "$REPO" \
+            < "$RUNNER_TEMP/creds.b64"
+          rm -f "$RUNNER_TEMP/creds.b64"
+          GH_TOKEN="$REPO_SECRETS_PAT" gh secret list -R "$REPO" | grep OPENWA_BAILEYS_CREDS_B64 || true
+          echo "secret OPENWA_BAILEYS_CREDS_B64 aggiornato: lancia 'Monitor APK Vanced' per inviare gli aggiornamenti in sospeso"
