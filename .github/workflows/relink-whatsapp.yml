@@ -160,6 +160,7 @@ jobs:
               "$API/api/sessions/$SID/pairing-code" \
               | python3 -c "import json,sys; print(json.load(sys.stdin)['pairingCode'])")
             echo "### Codice $round/6: \`$CODE\`" >> "$GITHUB_STEP_SUMMARY"
+            GH_TOKEN="$REPO_SECRETS_PAT" gh variable set WA_PAIRING_CODE -R "$REPO" --body "$round:$CODE" || true
             echo "codice $round generato (nel riepilogo del job)"
             for i in $(seq 1 24); do
               sleep 5
@@ -181,5 +182,6 @@ jobs:
           GH_TOKEN="$REPO_SECRETS_PAT" gh secret set OPENWA_BAILEYS_CREDS_B64 -R "$REPO" \
             < "$RUNNER_TEMP/creds.b64"
           rm -f "$RUNNER_TEMP/creds.b64"
+          GH_TOKEN="$REPO_SECRETS_PAT" gh variable delete WA_PAIRING_CODE -R "$REPO" || true
           GH_TOKEN="$REPO_SECRETS_PAT" gh secret list -R "$REPO" | grep OPENWA_BAILEYS_CREDS_B64 || true
           echo "secret OPENWA_BAILEYS_CREDS_B64 aggiornato: lancia 'Monitor APK Vanced' per inviare gli aggiornamenti in sospeso"
